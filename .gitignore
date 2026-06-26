@@ -1,10 +1,8 @@
+# --- Project-specific ---------------------------------------------------------
 # Python virtual environment
 .venv/
 venv/
-
-# Byte-compiled / caches
-__pycache__/
-*.py[cod]
+env/
 
 # Generated Core ML model (regenerate with: python convert_coreml.py)
 *.mlpackage/
@@ -17,5 +15,42 @@ __pycache__/
 captures/
 logs/
 
-# macOS
+# --- Python -------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+.eggs/
+.installed.cfg
+*.egg
+
+# Test / coverage / type-check caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+.cache/
+
+# Environments / secrets
+.env
+.env.*
+.python-version
+
+# --- Editors / IDEs -----------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# --- macOS --------------------------------------------------------------------
 .DS_Store
+.AppleDouble
+.LSOverride
+._*
