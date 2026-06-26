@@ -424,7 +424,8 @@ def parse_args():
                    help="Minimum detector confidence to keep a face.")
     p.add_argument("--capture-max", type=int, default=500,
                    help="Keep at most this many crops (oldest deleted; 0=unlimited).")
-    p.add_argument("--no-fps", action="store_true")
+    p.add_argument("--fps", action="store_true",
+                   help="Show the FPS overlay (off by default; toggle live with `s`).")
     p.add_argument("--mirror", action="store_true")
     p.add_argument("--smooth", type=float, default=0.0,
                    help="EMA weight on previous depth map (0=off, e.g. 0.5).")
@@ -455,7 +456,7 @@ def main():
     cv2.setWindowProperty(win, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
     cmap_idx = COLORMAP_ORDER.index(args.colormap)
-    show_fps = not args.no_fps
+    show_fps = args.fps
     mirror = args.mirror
     fullscreen = True
     prev_depth = None

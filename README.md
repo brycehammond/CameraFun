@@ -22,7 +22,7 @@ The model (~50MB for Small) auto-downloads on first run.
 | `f`      | Toggle fullscreen       |
 | `c`      | Cycle colormap          |
 | `e`      | Cycle visual effect     |
-| `s`      | Toggle FPS overlay      |
+| `s`      | Toggle FPS overlay (off by default; `--fps` to start on) |
 | `m`      | Toggle mirror           |
 
 ### Effects (`e` to cycle, or `--effect NAME`)
