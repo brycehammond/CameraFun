@@ -10,7 +10,11 @@ __pycache__/
 *.mlpackage/
 *.mlmodel
 
-# Runtime logs from the launchd agent
+# Downloaded models (YuNet face detector, etc.)
+*.onnx
+
+# Captured face crops + runtime logs from the launchd agent
+captures/
 logs/
 
 # macOS

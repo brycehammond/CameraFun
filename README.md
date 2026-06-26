@@ -59,6 +59,37 @@ python depth_display.py --camera 0 --infer-size 392 --colormap turbo --smooth 0.
 - **Slow framerate**: lower `--infer-size`, or stay on the Small model.
 - **Wrong webcam**: bump `--camera` to 1, 2, etc.
 
+## Face capture (optional)
+
+Detect faces in the webcam feed and save cropped images, running on a background
+thread so the display never stalls.
+
+```bash
+# One-time: download the YuNet detector (~230 KB)
+curl -L -o face_detection_yunet_2023mar.onnx \
+  https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx
+
+python depth_display.py --coreml depth_anything_v2_518.mlpackage --capture-faces
+```
+
+Crops land in `captures/` as timestamped JPEGs. A per-face cooldown keyed on
+screen position avoids saving a lingering person every frame, and the folder is
+rotated to a max file count for always-on use.
+
+| Flag                  | Default | Meaning                                        |
+|-----------------------|---------|------------------------------------------------|
+| `--capture-faces`     | off     | Enable detection + capture                     |
+| `--capture-dir`       | captures| Output directory                               |
+| `--face-model`        | (cwd)   | Path to the YuNet `.onnx`                       |
+| `--detect-every`      | 5       | Run detection every Nth frame                  |
+| `--capture-cooldown`  | 3.0     | Min seconds between saves of a face at one spot |
+| `--capture-min-conf`  | 0.7     | Minimum detector confidence                    |
+| `--capture-max`       | 500     | Keep at most N crops (oldest deleted; 0=∞)     |
+
+It degrades gracefully: if the model is missing or unsupported it prints a note
+and runs the display without capture. **Privacy:** this stores images of people —
+post a notice, set a retention limit, and secure the folder as appropriate.
+
 ## Core ML / Neural Engine (recommended for always-on)
 
 Running on the Apple Neural Engine (ANE) instead of MPS draws far less power and

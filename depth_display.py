@@ -8,10 +8,15 @@ This is a working baseline. See CLAUDE.md for the full feature list to build out
 """
 
 import argparse
+import os
+import threading
 import time
 
 import cv2
 import numpy as np
+
+YUNET_URL = ("https://github.com/opencv/opencv_zoo/raw/main/models/"
+             "face_detection_yunet/face_detection_yunet_2023mar.onnx")
 
 COLORMAPS = {
     "inferno": cv2.COLORMAP_INFERNO,
@@ -221,6 +226,141 @@ class CoreMLBackend:
         return cv2.resize(depth, (w, h))
 
 
+class FaceCapture:
+    """Background face detection + capture (YuNet on a worker thread).
+
+    Detection runs off the render thread so the display never stalls. Each
+    detected face is cropped (with margin) and saved, with a per-face cooldown
+    keyed on screen position so a lingering person isn't saved every frame. The
+    capture directory is rotated to a max file count for always-on use.
+    """
+
+    def __init__(self, model_path, capture_dir, min_conf, cooldown,
+                 max_files, margin=0.4):
+        self.detector = cv2.FaceDetectorYN_create(
+            model_path, "", (320, 320), score_threshold=min_conf)
+        self.capture_dir = capture_dir
+        self.cooldown = cooldown
+        self.max_files = max_files
+        self.margin = margin
+        os.makedirs(capture_dir, exist_ok=True)
+        self._lock = threading.Lock()
+        self._latest = None
+        self._recent = []  # [(cx, cy, last_saved_time), ...]
+        self._running = False
+        self._thread = None
+
+    def start(self):
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+
+    def offer(self, frame):
+        """Hand the worker the latest frame (cheap copy; called every Nth frame)."""
+        with self._lock:
+            self._latest = frame.copy()
+
+    def _loop(self):
+        while self._running:
+            with self._lock:
+                frame = self._latest
+                self._latest = None
+            if frame is None:
+                time.sleep(0.005)
+                continue
+            try:
+                self._process(frame)
+            except Exception as e:  # never let capture kill the display
+                print(f"[face-capture] error: {e}")
+
+    def _process(self, frame):
+        h, w = frame.shape[:2]
+        self.detector.setInputSize((w, h))
+        _, faces = self.detector.detect(frame)
+        if faces is None:
+            return
+        now = time.time()
+        for f in faces:
+            x, y, fw, fh = (int(v) for v in f[:4])
+            score = float(f[-1])
+            x0, y0 = max(0, x), max(0, y)
+            x1, y1 = min(w, x + fw), min(h, y + fh)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            cx, cy = (x0 + x1) // 2, (y0 + y1) // 2
+            if not self._should_save(cx, cy, max(fw, fh), now):
+                continue
+            self._save(frame, x0, y0, x1, y1, now, score)
+
+    def _should_save(self, cx, cy, size, now):
+        """True if no recently-saved face sits near this one; updates state."""
+        radius2 = max(size, 1) ** 2
+        for i, (rx, ry, ts) in enumerate(self._recent):
+            if (rx - cx) ** 2 + (ry - cy) ** 2 <= radius2:
+                if now - ts < self.cooldown:
+                    return False
+                self._recent[i] = (cx, cy, now)
+                return True
+        self._recent.append((cx, cy, now))
+        # Drop entries we haven't seen in a while so the list stays small.
+        self._recent = [r for r in self._recent if now - r[2] < self.cooldown * 4]
+        return True
+
+    def _save(self, frame, x0, y0, x1, y1, now, score):
+        h, w = frame.shape[:2]
+        mw, mh = int((x1 - x0) * self.margin), int((y1 - y0) * self.margin)
+        crop = frame[max(0, y0 - mh):min(h, y1 + mh),
+                     max(0, x0 - mw):min(w, x1 + mw)]
+        ts = time.strftime("%Y%m%d_%H%M%S", time.localtime(now))
+        name = f"face_{ts}_{int((now % 1) * 1000):03d}_{(x0 + x1) // 2}.jpg"
+        cv2.imwrite(os.path.join(self.capture_dir, name), crop)
+        print(f"[face-capture] saved {name} (conf={score:.2f})")
+        self._rotate()
+
+    def _rotate(self):
+        if self.max_files <= 0:
+            return
+        files = sorted(f for f in os.listdir(self.capture_dir)
+                       if f.endswith(".jpg"))
+        for f in files[:max(0, len(files) - self.max_files)]:
+            try:
+                os.remove(os.path.join(self.capture_dir, f))
+            except OSError:
+                pass
+
+
+def build_face_capture(args):
+    """Construct a started FaceCapture, or None (with a reason) on any problem."""
+    if not args.capture_faces:
+        return None
+    if not hasattr(cv2, "FaceDetectorYN_create"):
+        print("[face-capture] this OpenCV build lacks FaceDetectorYN; skipping.")
+        return None
+    if not os.path.exists(args.face_model):
+        print(f"[face-capture] model not found: {args.face_model}\n"
+              f"  Download it (~230 KB), then rerun:\n"
+              f"    curl -L -o {args.face_model} {YUNET_URL}\n"
+              f"  Continuing without face capture.")
+        return None
+    try:
+        fc = FaceCapture(args.face_model, args.capture_dir,
+                         args.capture_min_conf, args.capture_cooldown,
+                         args.capture_max)
+        fc.start()
+        print(f"[face-capture] on -> {args.capture_dir}/ "
+              f"(every {args.detect_every} frames, conf>={args.capture_min_conf}, "
+              f"cooldown {args.capture_cooldown}s)")
+        return fc
+    except Exception as e:
+        print(f"[face-capture] failed to start ({e}); continuing without it.")
+        return None
+
+
 def resolve_display_size(arg):
     """Return (w, h) to scale output to, or None to leave frames untouched.
 
@@ -270,6 +410,20 @@ def parse_args():
     p.add_argument("--compute-units", default="ALL",
                    choices=["ALL", "CPU_AND_NE", "CPU_AND_GPU", "CPU_ONLY"],
                    help="Core ML compute units (only used with --coreml).")
+    p.add_argument("--capture-faces", action="store_true",
+                   help="Detect faces (YuNet, background thread) and save crops.")
+    p.add_argument("--capture-dir", default="captures",
+                   help="Where to write captured face crops.")
+    p.add_argument("--face-model", default="face_detection_yunet_2023mar.onnx",
+                   help="Path to the YuNet ONNX model (see README to download).")
+    p.add_argument("--detect-every", type=int, default=5,
+                   help="Run detection every Nth frame (lower = more often).")
+    p.add_argument("--capture-cooldown", type=float, default=3.0,
+                   help="Min seconds between saves of a face at the same spot.")
+    p.add_argument("--capture-min-conf", type=float, default=0.7,
+                   help="Minimum detector confidence to keep a face.")
+    p.add_argument("--capture-max", type=int, default=500,
+                   help="Keep at most this many crops (oldest deleted; 0=unlimited).")
     p.add_argument("--no-fps", action="store_true")
     p.add_argument("--mirror", action="store_true")
     p.add_argument("--smooth", type=float, default=0.0,
@@ -281,6 +435,7 @@ def main():
     args = parse_args()
 
     display_size = resolve_display_size(args.display_size)
+    capture = build_face_capture(args)
 
     if args.coreml:
         backend = CoreMLBackend(args.coreml, args.compute_units)
@@ -311,6 +466,7 @@ def main():
     fx_state = {name: {} for name in EFFECT_ORDER}
     start = time.time()
     last_cycle = start
+    frame_count = 0
 
     try:
         while True:
@@ -320,6 +476,10 @@ def main():
                 continue
             if mirror:
                 frame = cv2.flip(frame, 1)
+
+            frame_count += 1
+            if capture is not None and frame_count % args.detect_every == 0:
+                capture.offer(frame)
 
             depth = backend.infer(frame)  # frame-sized float depth map
 
@@ -376,6 +536,8 @@ def main():
                     cv2.WINDOW_FULLSCREEN if fullscreen else cv2.WINDOW_NORMAL,
                 )
     finally:
+        if capture is not None:
+            capture.stop()
         cap.release()
         cv2.destroyAllWindows()
 
