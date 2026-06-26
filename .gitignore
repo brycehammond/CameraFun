@@ -1,0 +1,17 @@
+# Python virtual environment
+.venv/
+venv/
+
+# Byte-compiled / caches
+__pycache__/
+*.py[cod]
+
+# Generated Core ML model (regenerate with: python convert_coreml.py)
+*.mlpackage/
+*.mlmodel
+
+# Runtime logs from the launchd agent
+logs/
+
+# macOS
+.DS_Store

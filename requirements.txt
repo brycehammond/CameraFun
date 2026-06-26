@@ -1,0 +1,10 @@
+torch
+torchvision
+transformers
+opencv-python
+pillow
+numpy
+
+# Optional — only needed to convert to / run the Core ML (Neural Engine) model.
+# See convert_coreml.py and the "Core ML" section of the README.
+coremltools

@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  LaunchAgent template for the always-on Depth Anything display.
+
+  This is a *user* LaunchAgent (not a daemon): the app opens a fullscreen GUI
+  window and needs the camera + display, both of which only exist inside the
+  logged-in user's Aqua session. Daemons run with no GUI and cannot do this.
+
+  Do not edit and copy this file by hand — run ./install_launchd.sh, which fills
+  in the __PLACEHOLDER__ paths from your checkout and loads the agent. The
+  placeholders below are intentional.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.bryce.depthdisplay</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON__</string>
+        <string>__PROJECT_DIR__/depth_display.py</string>
+        <string>--coreml</string>
+        <string>__PROJECT_DIR__/depth_anything_v2_518.mlpackage</string>
+        <string>--smooth</string>
+        <string>0.5</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__PROJECT_DIR__</string>
+
+    <!-- Start at login and keep it alive: relaunch if it crashes or exits. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Back off a little so a crash loop doesn't peg the machine. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>__PROJECT_DIR__/logs/depthdisplay.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__PROJECT_DIR__/logs/depthdisplay.err.log</string>
+
+    <!-- HF model cache lives under HOME; make sure it's set for the agent. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+    </dict>
+</dict>
+</plist>
