@@ -368,6 +368,12 @@ def resolve_display_size(arg):
     top-left instead of filling the screen. Scaling each frame to the screen
     resolution first makes it fill. An explicit --display-size wins; otherwise
     we ask Tkinter (stdlib) for the screen size.
+
+    The Tk probe runs in a short-lived subprocess: creating and destroying a
+    Tk root in this process leaves the Tcl/Tk runtime half-torn-down, and once
+    a Core ML model is loaded, OpenCV's macOS window backend re-enters that
+    dead interpreter and aborts (SIGABRT: "Tcl_FindHashEntry on deleted
+    table"). Probing out-of-process keeps our GUI runtime pristine.
     """
     if arg:
         try:
@@ -375,14 +381,22 @@ def resolve_display_size(arg):
             return w, h
         except ValueError:
             raise SystemExit(f"--display-size must look like 1920x1080, got {arg!r}")
+    import subprocess
+    import sys
+    probe = (
+        "import tkinter\n"
+        "r = tkinter.Tk(); r.withdraw()\n"
+        "print(r.winfo_screenwidth(), r.winfo_screenheight())\n"
+        "r.destroy()\n"
+    )
     try:
-        import tkinter
-        root = tkinter.Tk()
-        root.withdraw()
-        size = (root.winfo_screenwidth(), root.winfo_screenheight())
-        root.destroy()
-        print(f"Auto-detected display size: {size[0]}x{size[1]}")
-        return size
+        out = subprocess.run([sys.executable, "-c", probe],
+                             capture_output=True, text=True, timeout=15)
+        if out.returncode != 0:
+            raise RuntimeError((out.stderr or "").strip() or "Tk probe failed")
+        w, h = (int(v) for v in out.stdout.split())
+        print(f"Auto-detected display size: {w}x{h}")
+        return (w, h)
     except Exception as e:
         print(f"Could not auto-detect display size ({e}); "
               "pass --display-size WxH. Displaying frames at native size.")
