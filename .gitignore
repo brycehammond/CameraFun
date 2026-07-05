@@ -11,6 +11,11 @@ env/
 # Downloaded models (YuNet face detector, etc.)
 *.onnx
 
+# Downloaded fast-neural-style weights (fetch with the README curl command)
+saved_models/
+saved_models.zip
+*.pth
+
 # Captured face crops + runtime logs from the launchd agent
 captures/
 logs/

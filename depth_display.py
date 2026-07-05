@@ -157,6 +157,24 @@ EFFECTS = {
 EFFECT_ORDER = list(EFFECTS.keys())
 
 
+# --- Neural style transfer ---------------------------------------------------
+# Fast neural style (Johnson et al. 2016): a small feed-forward TransformerNet,
+# one per style, that repaints the *RGB frame* in real time on MPS. Unlike the
+# depth effects above, these ignore the depth map entirely — so when a style
+# mode is active the depth model is skipped (running two nets/frame is too slow).
+#
+# Weights are the official pretrained checkpoints from the PyTorch examples repo
+# (candy, mosaic, udnie, rain_princess). See the README for the one-time download.
+
+STYLES = {
+    "candy": "candy.pth",
+    "mosaic": "mosaic.pth",
+    "udnie": "udnie.pth",
+    "rain": "rain_princess.pth",
+}
+STYLE_ORDER = list(STYLES.keys())
+
+
 def pick_device():
     import torch
     if torch.backends.mps.is_available():
@@ -224,6 +242,171 @@ class CoreMLBackend:
         out = self.model.predict({self.in_name: self._Image.fromarray(rgb)})
         depth = np.squeeze(out[self.out_name])
         return cv2.resize(depth, (w, h))
+
+
+def _transformer_net(torch):
+    """Build a fresh TransformerNet (Johnson et al.) using the given torch module.
+
+    Defined lazily so importing this file doesn't require torch (the Core ML
+    path avoids it). Matches the pytorch/examples architecture exactly so the
+    official pretrained checkpoints load without modification.
+    """
+    nn = torch.nn
+    F = torch.nn.functional
+
+    # NB: submodule names (reflection_pad, conv2d) must match the pretrained
+    # checkpoints' state_dict keys, or load_state_dict fails.
+    class ConvLayer(nn.Module):
+        def __init__(self, in_c, out_c, k, stride):
+            super().__init__()
+            self.reflection_pad = nn.ReflectionPad2d(k // 2)
+            self.conv2d = nn.Conv2d(in_c, out_c, k, stride)
+
+        def forward(self, x):
+            return self.conv2d(self.reflection_pad(x))
+
+    class UpsampleConvLayer(nn.Module):
+        def __init__(self, in_c, out_c, k, stride, upsample=None):
+            super().__init__()
+            self.upsample = upsample
+            self.reflection_pad = nn.ReflectionPad2d(k // 2)
+            self.conv2d = nn.Conv2d(in_c, out_c, k, stride)
+
+        def forward(self, x):
+            if self.upsample:
+                x = F.interpolate(x, mode="nearest", scale_factor=self.upsample)
+            return self.conv2d(self.reflection_pad(x))
+
+    class ResidualBlock(nn.Module):
+        def __init__(self, c):
+            super().__init__()
+            self.conv1 = ConvLayer(c, c, 3, 1)
+            self.in1 = nn.InstanceNorm2d(c, affine=True)
+            self.conv2 = ConvLayer(c, c, 3, 1)
+            self.in2 = nn.InstanceNorm2d(c, affine=True)
+            self.relu = nn.ReLU()
+
+        def forward(self, x):
+            y = self.relu(self.in1(self.conv1(x)))
+            y = self.in2(self.conv2(y))
+            return x + y
+
+    class TransformerNet(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv1 = ConvLayer(3, 32, 9, 1)
+            self.in1 = nn.InstanceNorm2d(32, affine=True)
+            self.conv2 = ConvLayer(32, 64, 3, 2)
+            self.in2 = nn.InstanceNorm2d(64, affine=True)
+            self.conv3 = ConvLayer(64, 128, 3, 2)
+            self.in3 = nn.InstanceNorm2d(128, affine=True)
+            self.res1 = ResidualBlock(128)
+            self.res2 = ResidualBlock(128)
+            self.res3 = ResidualBlock(128)
+            self.res4 = ResidualBlock(128)
+            self.res5 = ResidualBlock(128)
+            self.deconv1 = UpsampleConvLayer(128, 64, 3, 1, upsample=2)
+            self.in4 = nn.InstanceNorm2d(64, affine=True)
+            self.deconv2 = UpsampleConvLayer(64, 32, 3, 1, upsample=2)
+            self.in5 = nn.InstanceNorm2d(32, affine=True)
+            self.deconv3 = ConvLayer(32, 3, 9, 1)
+            self.relu = nn.ReLU()
+
+        def forward(self, x):
+            y = self.relu(self.in1(self.conv1(x)))
+            y = self.relu(self.in2(self.conv2(y)))
+            y = self.relu(self.in3(self.conv3(y)))
+            y = self.res1(y)
+            y = self.res2(y)
+            y = self.res3(y)
+            y = self.res4(y)
+            y = self.res5(y)
+            y = self.relu(self.in4(self.deconv1(y)))
+            y = self.relu(self.in5(self.deconv2(y)))
+            return self.deconv3(y)
+
+    return TransformerNet()
+
+
+class StyleBackend:
+    """Fast neural style transfer over the live RGB frame (MPS/CUDA/CPU).
+
+    One pretrained TransformerNet per style; models are loaded lazily on first
+    use so an unused style never costs memory. Inference runs at a reduced
+    longest-side resolution and the result is upscaled back to frame size.
+    """
+
+    def __init__(self, styles_dir, infer_size, device=None):
+        import re
+        import torch
+        self._torch = torch
+        self._re = re
+        self.device = device or pick_device()
+        self.styles_dir = styles_dir
+        self.infer_size = infer_size
+        self._models = {}  # name -> loaded net
+
+    def available(self):
+        """Style names whose checkpoint files are present, in cycle order."""
+        return [n for n in STYLE_ORDER
+                if os.path.exists(os.path.join(self.styles_dir, STYLES[n]))]
+
+    def _get(self, name):
+        net = self._models.get(name)
+        if net is not None:
+            return net
+        torch = self._torch
+        path = os.path.join(self.styles_dir, STYLES[name])
+        try:
+            state = torch.load(path, map_location=self.device, weights_only=True)
+        except TypeError:  # older torch without weights_only
+            state = torch.load(path, map_location=self.device)
+        # The 2017-era checkpoints carry deprecated InstanceNorm running stats
+        # that modern InstanceNorm2d doesn't register — drop them so load is strict.
+        for k in list(state.keys()):
+            if self._re.search(r"in\d+\.running_(mean|var)$", k):
+                del state[k]
+        net = _transformer_net(torch).to(self.device).eval()
+        net.load_state_dict(state)
+        self._models[name] = net
+        print(f"[style] loaded {name} on {self.device}")
+        return net
+
+    def stylize(self, frame_bgr, name):
+        torch = self._torch
+        h, w = frame_bgr.shape[:2]
+        scale = self.infer_size / max(h, w)
+        small = cv2.resize(frame_bgr, (max(1, int(w * scale)), max(1, int(h * scale))))
+        rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB).astype(np.float32)
+        # Models expect RGB in 0-255 (ToTensor()*255), CHW, batched.
+        t = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0).to(self.device)
+        with torch.inference_mode():
+            out = self._get(name)(t).clamp(0, 255)
+        out = out.squeeze(0).permute(1, 2, 0).to("cpu").numpy().astype(np.uint8)
+        bgr = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
+        return cv2.resize(bgr, (w, h))
+
+
+def build_style_backend(args):
+    """Construct a StyleBackend and its available styles, or (None, []) with a hint."""
+    if args.no_style:
+        return None, []
+    try:
+        sb = StyleBackend(args.styles_dir, args.style_size)
+    except Exception as e:
+        print(f"[style] disabled ({e}); continuing without style transfer.")
+        return None, []
+    avail = sb.available()
+    if not avail:
+        print(f"[style] no style checkpoints in {args.styles_dir}/ — style modes off.\n"
+              f"  One-time download (~26 MB) to enable them:\n"
+              f"    curl -L -o saved_models.zip "
+              f'"https://www.dropbox.com/s/lrvwfehqdcxoza8/saved_models.zip?dl=1"\n'
+              f"    unzip saved_models.zip   # creates saved_models/*.pth")
+        return None, []
+    print(f"[style] on -> {', '.join(avail)} @ {args.style_size}px "
+          f"(cycle into them with `e`)")
+    return sb, avail
 
 
 class FaceCapture:
@@ -438,6 +621,13 @@ def parse_args():
                    help="Minimum detector confidence to keep a face.")
     p.add_argument("--capture-max", type=int, default=500,
                    help="Keep at most this many crops (oldest deleted; 0=unlimited).")
+    p.add_argument("--styles-dir", default="saved_models",
+                   help="Directory holding the fast-neural-style .pth checkpoints.")
+    p.add_argument("--style-size", type=int, default=640,
+                   help="Longest side for style-transfer inference. Lower = faster "
+                        "(480 ~83fps, 640 ~52fps, 720 ~40fps on M1 MPS).")
+    p.add_argument("--no-style", action="store_true",
+                   help="Disable neural style-transfer modes even if weights exist.")
     p.add_argument("--fps", action="store_true",
                    help="Show the FPS overlay (off by default; toggle live with `s`).")
     p.add_argument("--mirror", action="store_true")
@@ -456,6 +646,8 @@ def main():
         backend = CoreMLBackend(args.coreml, args.compute_units)
     else:
         backend = TorchBackend(args.model, args.infer_size)
+
+    style_backend, avail_styles = build_style_backend(args)
 
     cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
@@ -477,7 +669,12 @@ def main():
     last = time.time()
     fps = 0.0
 
+    # Two independent cycles that each remember their place: `e` walks the depth
+    # effects, `t` walks the styles. `active_kind` says which is currently on
+    # screen; effect_idx / style_idx hold each cycle's position across switches.
     effect_idx = EFFECT_ORDER.index(args.effect)
+    style_idx = 0
+    active_kind = "depth"
     fx_state = {name: {} for name in EFFECT_ORDER}
     start = time.time()
     last_cycle = start
@@ -496,35 +693,53 @@ def main():
             if capture is not None and frame_count % args.detect_every == 0:
                 capture.offer(frame)
 
-            depth = backend.infer(frame)  # frame-sized float depth map
-
-            # Normalize 0-255
-            d_min, d_max = depth.min(), depth.max()
-            norm = (depth - d_min) / (d_max - d_min + 1e-6)
-
-            # Optional temporal smoothing
-            if args.smooth > 0 and prev_depth is not None:
-                norm = args.smooth * prev_depth + (1 - args.smooth) * norm
-            prev_depth = norm
-
             now = time.time()
 
-            # Auto-advance the effect on a timer, if enabled.
+            # Auto-advance on a timer, if enabled: sweep every depth effect, then
+            # every style, then wrap — hands-off ambient rotation over everything.
             if args.cycle > 0 and now - last_cycle >= args.cycle:
-                effect_idx = (effect_idx + 1) % len(EFFECT_ORDER)
+                if active_kind == "depth":
+                    effect_idx += 1
+                    if effect_idx >= len(EFFECT_ORDER):
+                        effect_idx = 0
+                        if avail_styles:
+                            active_kind, style_idx = "style", 0
+                else:
+                    style_idx += 1
+                    if style_idx >= len(avail_styles):
+                        style_idx, active_kind, effect_idx = 0, "depth", 0
                 last_cycle = now
 
-            effect = EFFECT_ORDER[effect_idx]
-            cmap = COLORMAPS[COLORMAP_ORDER[cmap_idx]]
-            colored = EFFECTS[effect](norm.astype(np.float32), cmap,
-                                      now - start, fx_state[effect])
+            kind = active_kind
+            name = (avail_styles[style_idx] if kind == "style"
+                    else EFFECT_ORDER[effect_idx])
+            if kind == "style":
+                # Style modes ignore depth — repaint the RGB frame directly.
+                colored = style_backend.stylize(frame, name)
+            else:
+                depth = backend.infer(frame)  # frame-sized float depth map
+
+                # Normalize 0-255
+                d_min, d_max = depth.min(), depth.max()
+                norm = (depth - d_min) / (d_max - d_min + 1e-6)
+
+                # Optional temporal smoothing
+                if args.smooth > 0 and prev_depth is not None:
+                    norm = args.smooth * prev_depth + (1 - args.smooth) * norm
+                prev_depth = norm
+
+                cmap = COLORMAPS[COLORMAP_ORDER[cmap_idx]]
+                colored = EFFECTS[name](norm.astype(np.float32), cmap,
+                                        now - start, fx_state[name])
 
             # FPS
             fps = 0.9 * fps + 0.1 * (1.0 / max(now - last, 1e-6))
             last = now
             if show_fps:
+                label = (f"{name} / {COLORMAP_ORDER[cmap_idx]}"
+                         if kind == "depth" else f"style:{name}")
                 cv2.putText(colored,
-                            f"{fps:4.1f} fps  [{effect} / {COLORMAP_ORDER[cmap_idx]}]",
+                            f"{fps:4.1f} fps  [{label}]",
                             (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
                             (255, 255, 255), 2, cv2.LINE_AA)
 
@@ -538,7 +753,17 @@ def main():
             elif key == ord("c"):
                 cmap_idx = (cmap_idx + 1) % len(COLORMAP_ORDER)
             elif key == ord("e"):
-                effect_idx = (effect_idx + 1) % len(EFFECT_ORDER)
+                # Switch to the depth effects (resuming where you left off);
+                # advance only if you're already on them.
+                if active_kind == "depth":
+                    effect_idx = (effect_idx + 1) % len(EFFECT_ORDER)
+                active_kind = "depth"
+                last_cycle = now
+            elif key == ord("t") and avail_styles:
+                # Same, for the styles: resume, or advance if already on a style.
+                if active_kind == "style":
+                    style_idx = (style_idx + 1) % len(avail_styles)
+                active_kind = "style"
                 last_cycle = now
             elif key == ord("s"):
                 show_fps = not show_fps

@@ -21,7 +21,8 @@ The model (~50MB for Small) auto-downloads on first run.
 | `q`/`ESC`| Quit                    |
 | `f`      | Toggle fullscreen       |
 | `c`      | Cycle colormap          |
-| `e`      | Cycle visual effect     |
+| `e`      | Cycle depth effect      |
+| `t`      | Cycle neural style (style transfer) |
 | `s`      | Toggle FPS overlay (off by default; `--fps` to start on) |
 | `m`      | Toggle mirror           |
 
@@ -41,6 +42,36 @@ The model (~50MB for Small) auto-downloads on first run.
 
 Colormap cycling (`c`) still applies within the color-based effects. Pass
 `--cycle 30` to auto-advance through effects every 30s for hands-off ambient art.
+
+### Neural style transfer (`t` to cycle styles)
+
+Fast neural style transfer (Johnson et al.) repaints the live webcam frame in the
+style of a painting, in real time on the Neural Engine's GPU/MPS. Unlike the depth
+effects, these run their own network on the RGB frame, so the depth model is skipped
+while a style is active. Four pretrained styles ship from the PyTorch examples repo:
+`candy`, `mosaic`, `udnie`, `rain` (rain_princess).
+
+`e` and `t` are independent cycles: `e` steps through the depth effects, `t` steps
+through the styles, and pressing `e` from a style snaps straight back to the depth
+effects. (`--cycle N` still auto-advances through everything for hands-off ambient art.)
+
+```bash
+# One-time: download the pretrained style weights (~26 MB) into saved_models/
+curl -L -o saved_models.zip \
+  "https://www.dropbox.com/s/lrvwfehqdcxoza8/saved_models.zip?dl=1"
+unzip saved_models.zip        # creates saved_models/{candy,mosaic,udnie,rain_princess}.pth
+
+python depth_display.py        # `e` now cycles depth effects -> style modes
+```
+
+The styles appear in the `e` cycle automatically once the weights are present; if
+`saved_models/` is empty the app prints the download hint and runs without them.
+
+| Flag           | Default      | Meaning                                             |
+|----------------|--------------|-----------------------------------------------------|
+| `--styles-dir` | saved_models | Directory holding the style `.pth` checkpoints      |
+| `--style-size` | 640          | Longest side for style inference; M1 MPS: 480 ~83fps, 640 ~52fps, 720 ~40fps |
+| `--no-style`   | off          | Disable style modes even if weights are present     |
 
 ## Options
 
