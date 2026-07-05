@@ -817,6 +817,29 @@ def resolve_display_size(arg):
         return None
 
 
+def keep_display_awake():
+    """Hold a macOS power assertion so the screen won't sleep or lock while we run.
+
+    Spawns `caffeinate` bound to our own PID (`-w`), so it self-terminates if we
+    ever exit without cleaning up. -d keeps the display awake (this is what stops
+    the lock), -i blocks idle system sleep, -s blocks system sleep on AC power.
+    Returns the Popen handle (terminate it on teardown), or None if unavailable.
+    """
+    if sys.platform != "darwin":
+        return None
+    import subprocess
+    try:
+        proc = subprocess.Popen(
+            ["caffeinate", "-d", "-i", "-s", "-w", str(os.getpid())],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        print("[power] caffeinate holding display awake (no sleep/lock while running)")
+        return proc
+    except FileNotFoundError:
+        print("[power] caffeinate not found; screen may sleep/lock while running.")
+        return None
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Real-time Depth Anything v2 art display")
     p.add_argument("--camera", type=int, default=0)
@@ -877,6 +900,9 @@ def parse_args():
     p.add_argument("--mirror", action="store_true")
     p.add_argument("--smooth", type=float, default=0.0,
                    help="EMA weight on previous depth map (0=off, e.g. 0.5).")
+    p.add_argument("--allow-sleep", action="store_true",
+                   help="Let the display sleep/lock normally. By default (macOS) "
+                        "we hold a caffeinate assertion so the screen stays on.")
     return p.parse_args()
 
 
@@ -901,6 +927,7 @@ def quiet_native_stderr():
 def main():
     args = parse_args()
 
+    caffeinate = None if args.allow_sleep else keep_display_awake()
     display_size = resolve_display_size(args.display_size)
     capture = build_face_capture(args)
 
@@ -1058,6 +1085,8 @@ def main():
     finally:
         if capture is not None:
             capture.stop()
+        if caffeinate is not None:
+            caffeinate.terminate()
         cap.release()
         cv2.destroyAllWindows()
 
