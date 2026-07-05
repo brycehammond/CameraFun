@@ -175,6 +175,43 @@ STYLES = {
 STYLE_ORDER = list(STYLES.keys())
 
 
+# --- MediaPipe vision modes --------------------------------------------------
+# Person segmentation, pose skeletons, and face mesh via MediaPipe Tasks. Each
+# needs a model bundle downloaded once (see README / the printed hint). Like the
+# styles, these run on the RGB frame and skip depth inference while active.
+
+MP_MODEL_FILES = {
+    "segment": "selfie_segmenter.tflite",
+    "pose": "pose_landmarker_lite.task",
+    "face": "face_landmarker.task",
+}
+MP_MODEL_URLS = {
+    "segment": ("https://storage.googleapis.com/mediapipe-models/image_segmenter/"
+                "selfie_segmenter/float16/latest/selfie_segmenter.tflite"),
+    "pose": ("https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
+             "pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"),
+    "face": ("https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+             "face_landmarker/float16/latest/face_landmarker.task"),
+}
+# Each vision mode -> the model key it needs. A mode is only offered if its file
+# is present, so partial downloads still enable whatever's available.
+VISION_MODES = {
+    "silhouette": "segment",  # person over an animated color field
+    "pose": "pose",           # glowing skeleton on a dimmed frame
+    "facemesh": "face",       # glowing face-mesh points
+}
+VISION_ORDER = list(VISION_MODES.keys())
+
+# BlazePose 33-landmark topology (limbs + torso) for drawing the skeleton.
+POSE_CONNECTIONS = [
+    (11, 12), (11, 13), (13, 15), (15, 17), (15, 19), (15, 21), (17, 19),
+    (12, 14), (14, 16), (16, 18), (16, 20), (16, 22), (18, 20),
+    (11, 23), (12, 24), (23, 24),
+    (23, 25), (25, 27), (27, 29), (29, 31), (27, 31),
+    (24, 26), (26, 28), (28, 30), (30, 32), (28, 32),
+]
+
+
 def pick_device():
     import torch
     if torch.backends.mps.is_available():
@@ -405,8 +442,147 @@ def build_style_backend(args):
               f"    unzip saved_models.zip   # creates saved_models/*.pth")
         return None, []
     print(f"[style] on -> {', '.join(avail)} @ {args.style_size}px "
-          f"(cycle into them with `e`)")
+          f"(cycle with `t`)")
     return sb, avail
+
+
+class VisionBackend:
+    """MediaPipe Tasks: person segmentation, pose skeletons, and face mesh.
+
+    Each landmarker/segmenter is created lazily on first use (they're only built
+    if that mode is actually shown). All run in IMAGE mode on the RGB frame and
+    return a BGR image ready for display.
+    """
+
+    def __init__(self, models_dir, num_poses=4, num_faces=5):
+        import mediapipe as mp
+        from mediapipe.tasks.python import vision as mpv
+        self._mp = mp
+        self._mpv = mpv
+        self.models_dir = models_dir
+        self.num_poses = num_poses
+        self.num_faces = num_faces
+        self._pose = self._face = self._seg = None
+
+    def path(self, key):
+        return os.path.join(self.models_dir, MP_MODEL_FILES[key])
+
+    def available(self):
+        """Vision mode names whose model file is present, in cycle order."""
+        return [m for m in VISION_ORDER if os.path.exists(self.path(VISION_MODES[m]))]
+
+    def _image(self, frame_bgr):
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        return self._mp.Image(image_format=self._mp.ImageFormat.SRGB,
+                              data=np.ascontiguousarray(rgb))
+
+    def _pose_lm(self):
+        if self._pose is None:
+            mpv = self._mpv
+            self._pose = mpv.PoseLandmarker.create_from_options(
+                mpv.PoseLandmarkerOptions(
+                    base_options=self._mp.tasks.BaseOptions(
+                        model_asset_path=self.path("pose")),
+                    running_mode=mpv.RunningMode.IMAGE,
+                    num_poses=self.num_poses))
+        return self._pose
+
+    def _face_lm(self):
+        if self._face is None:
+            mpv = self._mpv
+            self._face = mpv.FaceLandmarker.create_from_options(
+                mpv.FaceLandmarkerOptions(
+                    base_options=self._mp.tasks.BaseOptions(
+                        model_asset_path=self.path("face")),
+                    running_mode=mpv.RunningMode.IMAGE,
+                    num_faces=self.num_faces))
+        return self._face
+
+    def _seg_lm(self):
+        if self._seg is None:
+            mpv = self._mpv
+            self._seg = mpv.ImageSegmenter.create_from_options(
+                mpv.ImageSegmenterOptions(
+                    base_options=self._mp.tasks.BaseOptions(
+                        model_asset_path=self.path("segment")),
+                    running_mode=mpv.RunningMode.IMAGE,
+                    output_confidence_masks=True))
+        return self._seg
+
+    def render(self, frame_bgr, mode, t):
+        if mode == "pose":
+            return self._render_pose(frame_bgr)
+        if mode == "facemesh":
+            return self._render_face(frame_bgr)
+        if mode == "silhouette":
+            return self._render_seg(frame_bgr, t)
+        return frame_bgr
+
+    @staticmethod
+    def _neon(base, marks, sigma):
+        """Composite glowing marks (drawn on black) over a dimmed base frame."""
+        glow = cv2.GaussianBlur(marks, (0, 0), sigma)
+        out = base.astype(np.int16) + marks.astype(np.int16) + glow.astype(np.int16)
+        return np.clip(out, 0, 255).astype(np.uint8)
+
+    def _render_pose(self, frame):
+        h, w = frame.shape[:2]
+        res = self._pose_lm().detect(self._image(frame))
+        marks = np.zeros_like(frame)
+        for lms in res.pose_landmarks:
+            pts = [(int(l.x * w), int(l.y * h)) for l in lms]
+            for a, b in POSE_CONNECTIONS:
+                if a < len(pts) and b < len(pts):
+                    cv2.line(marks, pts[a], pts[b], (0, 255, 255), 3, cv2.LINE_AA)
+            for p in pts:
+                cv2.circle(marks, p, 5, (255, 255, 255), -1, cv2.LINE_AA)
+        return self._neon((frame * 0.25).astype(np.uint8), marks, 6)
+
+    def _render_face(self, frame):
+        h, w = frame.shape[:2]
+        res = self._face_lm().detect(self._image(frame))
+        marks = np.zeros_like(frame)
+        for lms in res.face_landmarks:
+            for l in lms:
+                cv2.circle(marks, (int(l.x * w), int(l.y * h)), 1,
+                           (0, 255, 180), -1, cv2.LINE_AA)
+        return self._neon((frame * 0.35).astype(np.uint8), marks, 3)
+
+    def _render_seg(self, frame, t):
+        h, w = frame.shape[:2]
+        res = self._seg_lm().segment(self._image(frame))
+        mask = res.confidence_masks[0].numpy_view()  # HxW float, ~1 = person
+        if mask.shape != (h, w):
+            mask = cv2.resize(mask, (w, h))
+        mask = mask[..., None]
+        # Animated horizontal color field scrolling behind the person.
+        ramp = ((np.arange(w, dtype=np.float32) / w * 255 + t * 40) % 256).astype(np.uint8)
+        bg = cv2.applyColorMap(np.tile(ramp, (h, 1)), cv2.COLORMAP_TURBO)
+        out = frame.astype(np.float32) * mask + bg.astype(np.float32) * (1 - mask)
+        return out.astype(np.uint8)
+
+
+def build_vision_backend(args):
+    """Construct a VisionBackend + its available modes, or (None, []) with hints."""
+    if args.no_vision:
+        return None, []
+    try:
+        vb = VisionBackend(args.vision_dir, args.pose_count, args.face_count)
+    except Exception as e:
+        print(f"[vision] disabled ({e}); continuing without vision modes.")
+        return None, []
+    avail = vb.available()
+    missing = [k for k in MP_MODEL_FILES if not os.path.exists(vb.path(k))]
+    if missing:
+        print(f"[vision] missing model bundles in {args.vision_dir}/ — "
+              f"those modes are off. Download (once):")
+        print(f"    mkdir -p {args.vision_dir}")
+        for k in missing:
+            print(f"    curl -L -o {vb.path(k)} {MP_MODEL_URLS[k]}")
+    if not avail:
+        return None, []
+    print(f"[vision] on -> {', '.join(avail)} (cycle with `v`)")
+    return vb, avail
 
 
 class FaceCapture:
@@ -628,6 +804,14 @@ def parse_args():
                         "(480 ~83fps, 640 ~52fps, 720 ~40fps on M1 MPS).")
     p.add_argument("--no-style", action="store_true",
                    help="Disable neural style-transfer modes even if weights exist.")
+    p.add_argument("--vision-dir", default="mediapipe_models",
+                   help="Directory holding MediaPipe .task/.tflite model bundles.")
+    p.add_argument("--pose-count", type=int, default=4,
+                   help="Max simultaneous people for the pose skeleton mode.")
+    p.add_argument("--face-count", type=int, default=5,
+                   help="Max simultaneous faces for the face-mesh mode.")
+    p.add_argument("--no-vision", action="store_true",
+                   help="Disable MediaPipe vision modes even if models exist.")
     p.add_argument("--fps", action="store_true",
                    help="Show the FPS overlay (off by default; toggle live with `s`).")
     p.add_argument("--mirror", action="store_true")
@@ -648,6 +832,7 @@ def main():
         backend = TorchBackend(args.model, args.infer_size)
 
     style_backend, avail_styles = build_style_backend(args)
+    vision_backend, avail_vision = build_vision_backend(args)
 
     cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
@@ -669,16 +854,36 @@ def main():
     last = time.time()
     fps = 0.0
 
-    # Two independent cycles that each remember their place: `e` walks the depth
-    # effects, `t` walks the styles. `active_kind` says which is currently on
-    # screen; effect_idx / style_idx hold each cycle's position across switches.
-    effect_idx = EFFECT_ORDER.index(args.effect)
-    style_idx = 0
-    active_kind = "depth"
+    # Independent mode groups, each bound to a key and remembering its own place:
+    #   e -> depth effects, t -> neural styles, v -> MediaPipe vision modes.
+    # `active_group` is what's on screen; `pos[group]` is each group's position.
+    # Pressing a group's key resumes it (or advances if already active), so you
+    # can bounce between them without losing your spot. Empty groups (missing
+    # weights/models) are simply unreachable.
+    groups = [
+        ("depth", EFFECT_ORDER, ord("e")),
+        ("style", avail_styles, ord("t")),
+        ("vision", avail_vision, ord("v")),
+    ]
+    members = {g: lst for g, lst, _ in groups}
+    keymap = {key: g for g, _, key in groups}
+    group_order = [g for g, _, _ in groups]
+    pos = {g: 0 for g in group_order}
+    pos["depth"] = EFFECT_ORDER.index(args.effect)
+    active_group = "depth"
+
     fx_state = {name: {} for name in EFFECT_ORDER}
     start = time.time()
     last_cycle = start
     frame_count = 0
+
+    def advance_group(g):
+        """Next non-empty group after g in group_order (wraps; g if none else)."""
+        for step in range(1, len(group_order) + 1):
+            ng = group_order[(group_order.index(g) + step) % len(group_order)]
+            if members[ng]:
+                return ng
+        return g
 
     try:
         while True:
@@ -695,27 +900,23 @@ def main():
 
             now = time.time()
 
-            # Auto-advance on a timer, if enabled: sweep every depth effect, then
-            # every style, then wrap — hands-off ambient rotation over everything.
+            # Auto-advance on a timer, if enabled: sweep every mode in the active
+            # group, then move to the next non-empty group — hands-off rotation.
             if args.cycle > 0 and now - last_cycle >= args.cycle:
-                if active_kind == "depth":
-                    effect_idx += 1
-                    if effect_idx >= len(EFFECT_ORDER):
-                        effect_idx = 0
-                        if avail_styles:
-                            active_kind, style_idx = "style", 0
-                else:
-                    style_idx += 1
-                    if style_idx >= len(avail_styles):
-                        style_idx, active_kind, effect_idx = 0, "depth", 0
+                pos[active_group] += 1
+                if pos[active_group] >= len(members[active_group]):
+                    pos[active_group] = 0
+                    active_group = advance_group(active_group)
                 last_cycle = now
 
-            kind = active_kind
-            name = (avail_styles[style_idx] if kind == "style"
-                    else EFFECT_ORDER[effect_idx])
+            kind = active_group
+            name = members[kind][pos[kind]]
             if kind == "style":
                 # Style modes ignore depth — repaint the RGB frame directly.
                 colored = style_backend.stylize(frame, name)
+            elif kind == "vision":
+                # Vision modes also work on the RGB frame, no depth needed.
+                colored = vision_backend.render(frame, name, now - start)
             else:
                 depth = backend.infer(frame)  # frame-sized float depth map
 
@@ -737,7 +938,7 @@ def main():
             last = now
             if show_fps:
                 label = (f"{name} / {COLORMAP_ORDER[cmap_idx]}"
-                         if kind == "depth" else f"style:{name}")
+                         if kind == "depth" else f"{kind}:{name}")
                 cv2.putText(colored,
                             f"{fps:4.1f} fps  [{label}]",
                             (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
@@ -752,18 +953,13 @@ def main():
                 break
             elif key == ord("c"):
                 cmap_idx = (cmap_idx + 1) % len(COLORMAP_ORDER)
-            elif key == ord("e"):
-                # Switch to the depth effects (resuming where you left off);
-                # advance only if you're already on them.
-                if active_kind == "depth":
-                    effect_idx = (effect_idx + 1) % len(EFFECT_ORDER)
-                active_kind = "depth"
-                last_cycle = now
-            elif key == ord("t") and avail_styles:
-                # Same, for the styles: resume, or advance if already on a style.
-                if active_kind == "style":
-                    style_idx = (style_idx + 1) % len(avail_styles)
-                active_kind = "style"
+            elif key in keymap and members[keymap[key]]:
+                # A group key (e/t/v): switch to that group, resuming where you
+                # left off, or advance within it if it's already active.
+                g = keymap[key]
+                if active_group == g:
+                    pos[g] = (pos[g] + 1) % len(members[g])
+                active_group = g
                 last_cycle = now
             elif key == ord("s"):
                 show_fps = not show_fps

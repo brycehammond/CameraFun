@@ -1,7 +1,11 @@
 torch
 torchvision
 transformers
-opencv-python
+# opencv-contrib-python (superset of opencv-python) — MediaPipe needs the
+# contrib build; having both installed clashes on the cv2 namespace. Pinned <5
+# to stay on the 4.x API the app is written against.
+opencv-contrib-python<5
+mediapipe            # person segmentation, pose, and face-mesh vision modes
 pillow
 numpy
 

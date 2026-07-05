@@ -12,7 +12,20 @@ pip install -r requirements.txt
 python depth_display.py
 ```
 
-The model (~50MB for Small) auto-downloads on first run.
+The depth model (~50MB for Small) auto-downloads on first run.
+
+## Models & downloads
+
+Only the depth model is fetched automatically. The extra modes each need a one-time
+manual download (the app prints the exact `curl` command if a model is missing, and
+runs without that mode until you fetch it). Downloaded models are gitignored.
+
+| What                    | Size   | How                                   | Enables                     |
+|-------------------------|--------|---------------------------------------|-----------------------------|
+| Depth Anything V2 Small | ~50 MB | auto (Hugging Face, first run)        | depth effects (`e`)         |
+| Fast-neural-style `.pth`| ~26 MB | `curl` — see [style transfer](#neural-style-transfer-t-to-cycle-styles) | style modes (`t`) |
+| MediaPipe bundles       | ~10 MB | `curl` — see [vision modes](#mediapipe-vision-modes-v-to-cycle) | segmentation / pose / face mesh (`v`) |
+| YuNet face detector     | ~230 KB| `curl` — see [face capture](#face-capture-optional) | optional face capture |
 
 ## Controls
 
@@ -23,6 +36,7 @@ The model (~50MB for Small) auto-downloads on first run.
 | `c`      | Cycle colormap          |
 | `e`      | Cycle depth effect      |
 | `t`      | Cycle neural style (style transfer) |
+| `v`      | Cycle vision mode (segmentation / pose / face mesh) |
 | `s`      | Toggle FPS overlay (off by default; `--fps` to start on) |
 | `m`      | Toggle mirror           |
 
@@ -54,6 +68,35 @@ while a style is active. Four pretrained styles ship from the PyTorch examples r
 `e` and `t` are independent cycles: `e` steps through the depth effects, `t` steps
 through the styles, and pressing `e` from a style snaps straight back to the depth
 effects. (`--cycle N` still auto-advances through everything for hands-off ambient art.)
+
+### MediaPipe vision modes (`v` to cycle)
+
+Neural-engine computer-vision modes that work on the RGB frame (depth is skipped
+while one is active). Each needs a MediaPipe model bundle downloaded once:
+
+| Mode         | Model bundle                  | Look                                          |
+|--------------|-------------------------------|-----------------------------------------------|
+| `silhouette` | `selfie_segmenter.tflite`     | People kept in real color over a scrolling color field |
+| `pose`       | `pose_landmarker_lite.task`   | Glowing skeletons on a dimmed frame (up to 4 people) |
+| `facemesh`   | `face_landmarker.task`        | Glowing face-mesh points (up to 5 faces)      |
+
+```bash
+# One-time: download the model bundles (~10 MB total) into mediapipe_models/
+mkdir -p mediapipe_models
+curl -L -o mediapipe_models/selfie_segmenter.tflite \
+  https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite
+curl -L -o mediapipe_models/pose_landmarker_lite.task \
+  https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task
+curl -L -o mediapipe_models/face_landmarker.task \
+  https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task
+
+python depth_display.py        # `v` now cycles the vision modes
+```
+
+Each mode appears in the `v` cycle only if its bundle is present; the app prints the
+exact `curl` command for any that are missing and runs without them. `e`/`t`/`v` are
+three independent cycles, each remembering its place. Flags: `--vision-dir` (default
+`mediapipe_models`), `--pose-count` (4), `--face-count` (5), `--no-vision`.
 
 ```bash
 # One-time: download the pretrained style weights (~26 MB) into saved_models/

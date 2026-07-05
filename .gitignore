@@ -16,6 +16,11 @@ saved_models/
 saved_models.zip
 *.pth
 
+# Downloaded MediaPipe model bundles (fetch with the README curl commands)
+mediapipe_models/
+*.task
+*.tflite
+
 # Captured face crops + runtime logs from the launchd agent
 captures/
 logs/
