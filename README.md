@@ -102,6 +102,12 @@ three independent cycles, each remembering its place. Flags: `--vision-dir` (def
 `mediapipe_models`), `--pose-count` (4), `--face-count` (5), `--hand-count` (4),
 `--no-vision`.
 
+MediaPipe's native C++ logging is very chatty (`gl_context`, feedback-manager, and
+recurring clearcut-telemetry lines). It's **silenced by default** when a vision mode
+is active — which matters for the always-on `err.log` — by redirecting OS-level
+stderr; Python tracebacks are preserved. Pass `--verbose-mediapipe` to keep it for
+debugging.
+
 ```bash
 # One-time: download the pretrained style weights (~26 MB) into saved_models/
 curl -L -o saved_models.zip \

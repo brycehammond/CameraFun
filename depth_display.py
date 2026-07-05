@@ -9,6 +9,7 @@ This is a working baseline. See CLAUDE.md for the full feature list to build out
 
 import argparse
 import os
+import sys
 import threading
 import time
 
@@ -868,12 +869,33 @@ def parse_args():
                    help="Max simultaneous hands for the hand-tracking mode.")
     p.add_argument("--no-vision", action="store_true",
                    help="Disable MediaPipe vision modes even if models exist.")
+    p.add_argument("--verbose-mediapipe", action="store_true",
+                   help="Keep MediaPipe's noisy native C++ logging (silenced by "
+                        "default when vision modes are active).")
     p.add_argument("--fps", action="store_true",
                    help="Show the FPS overlay (off by default; toggle live with `s`).")
     p.add_argument("--mirror", action="store_true")
     p.add_argument("--smooth", type=float, default=0.0,
                    help="EMA weight on previous depth map (0=off, e.g. 0.5).")
     return p.parse_args()
+
+
+def quiet_native_stderr():
+    """Silence MediaPipe's native C++ log spam without hiding Python errors.
+
+    MediaPipe 0.10.x logs via absl at the C++ level (the `I0000/W0000/E0000`
+    lines: gl_context, feedback-manager, and the recurring clearcut-telemetry
+    failures), which ignores `GLOG_minloglevel` and absl's Python `set_verbosity`.
+    The only thing that works is redirecting OS-level stderr (fd 2). To keep
+    Python tracebacks visible, we first repoint `sys.stderr` at a dup of the real
+    stderr, then send fd 2 to /dev/null — so native writes vanish while Python's
+    own errors (and our prints) still reach the terminal / launchd log.
+    """
+    real = os.dup(2)
+    sys.stderr = os.fdopen(real, "w", buffering=1)
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, 2)
+    os.close(devnull)
 
 
 def main():
@@ -889,6 +911,12 @@ def main():
 
     style_backend, avail_styles = build_style_backend(args)
     vision_backend, avail_vision = build_vision_backend(args)
+
+    # MediaPipe's native logging is very chatty; hush it for always-on use unless
+    # asked to keep it. Only matters when a vision backend actually loaded.
+    if vision_backend is not None and not args.verbose_mediapipe:
+        print("[vision] silencing MediaPipe native logs (--verbose-mediapipe to keep)")
+        quiet_native_stderr()
 
     cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
