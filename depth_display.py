@@ -821,8 +821,9 @@ def keep_display_awake():
     """Hold a macOS power assertion so the screen won't sleep or lock while we run.
 
     Spawns `caffeinate` bound to our own PID (`-w`), so it self-terminates if we
-    ever exit without cleaning up. -d keeps the display awake (this is what stops
-    the lock), -i blocks idle system sleep, -s blocks system sleep on AC power.
+    ever exit without cleaning up. -d keeps the display awake — this is what stops
+    the lock, and it also holds the whole system up (via powerd) while the display
+    is on, which is exactly what an always-on installation wants.
     Returns the Popen handle (terminate it on teardown), or None if unavailable.
     """
     if sys.platform != "darwin":
@@ -830,7 +831,7 @@ def keep_display_awake():
     import subprocess
     try:
         proc = subprocess.Popen(
-            ["caffeinate", "-d", "-i", "-s", "-w", str(os.getpid())],
+            ["caffeinate", "-d", "-w", str(os.getpid())],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         print("[power] caffeinate holding display awake (no sleep/lock while running)")
