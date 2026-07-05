@@ -184,6 +184,7 @@ MP_MODEL_FILES = {
     "segment": "selfie_segmenter.tflite",
     "pose": "pose_landmarker_lite.task",
     "face": "face_landmarker.task",
+    "hand": "hand_landmarker.task",
 }
 MP_MODEL_URLS = {
     "segment": ("https://storage.googleapis.com/mediapipe-models/image_segmenter/"
@@ -192,6 +193,8 @@ MP_MODEL_URLS = {
              "pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"),
     "face": ("https://storage.googleapis.com/mediapipe-models/face_landmarker/"
              "face_landmarker/float16/latest/face_landmarker.task"),
+    "hand": ("https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
+             "hand_landmarker/float16/latest/hand_landmarker.task"),
 }
 # Each vision mode -> the model key it needs. A mode is only offered if its file
 # is present, so partial downloads still enable whatever's available.
@@ -199,6 +202,7 @@ VISION_MODES = {
     "silhouette": "segment",  # person over an animated color field
     "pose": "pose",           # glowing skeleton on a dimmed frame
     "facemesh": "face",       # glowing face-mesh points
+    "hands": "hand",          # glowing hand skeletons + fingertip light-painting
 }
 VISION_ORDER = list(VISION_MODES.keys())
 
@@ -209,6 +213,17 @@ POSE_CONNECTIONS = [
     (11, 23), (12, 24), (23, 24),
     (23, 25), (25, 27), (27, 29), (29, 31), (27, 31),
     (24, 26), (26, 28), (28, 30), (30, 32), (28, 32),
+]
+
+# MediaPipe 21-landmark hand topology. Fingertips are 4/8/12/16/20; index tip
+# (8) drives the light-painting trail.
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),          # thumb
+    (0, 5), (5, 6), (6, 7), (7, 8),          # index
+    (5, 9), (9, 10), (10, 11), (11, 12),     # middle
+    (9, 13), (13, 14), (14, 15), (15, 16),   # ring
+    (13, 17), (17, 18), (18, 19), (19, 20),  # pinky
+    (0, 17),                                 # palm base
 ]
 
 
@@ -454,7 +469,7 @@ class VisionBackend:
     return a BGR image ready for display.
     """
 
-    def __init__(self, models_dir, num_poses=4, num_faces=5):
+    def __init__(self, models_dir, num_poses=4, num_faces=5, num_hands=4):
         import mediapipe as mp
         from mediapipe.tasks.python import vision as mpv
         self._mp = mp
@@ -462,7 +477,9 @@ class VisionBackend:
         self.models_dir = models_dir
         self.num_poses = num_poses
         self.num_faces = num_faces
-        self._pose = self._face = self._seg = None
+        self.num_hands = num_hands
+        self._pose = self._face = self._seg = self._hand = None
+        self._trail = None  # decaying fingertip light-painting buffer
 
     def path(self, key):
         return os.path.join(self.models_dir, MP_MODEL_FILES[key])
@@ -509,6 +526,17 @@ class VisionBackend:
                     output_confidence_masks=True))
         return self._seg
 
+    def _hand_lm(self):
+        if self._hand is None:
+            mpv = self._mpv
+            self._hand = mpv.HandLandmarker.create_from_options(
+                mpv.HandLandmarkerOptions(
+                    base_options=self._mp.tasks.BaseOptions(
+                        model_asset_path=self.path("hand")),
+                    running_mode=mpv.RunningMode.IMAGE,
+                    num_hands=self.num_hands))
+        return self._hand
+
     def render(self, frame_bgr, mode, t):
         if mode == "pose":
             return self._render_pose(frame_bgr)
@@ -516,6 +544,8 @@ class VisionBackend:
             return self._render_face(frame_bgr)
         if mode == "silhouette":
             return self._render_seg(frame_bgr, t)
+        if mode == "hands":
+            return self._render_hands(frame_bgr)
         return frame_bgr
 
     @staticmethod
@@ -561,13 +591,37 @@ class VisionBackend:
         out = frame.astype(np.float32) * mask + bg.astype(np.float32) * (1 - mask)
         return out.astype(np.uint8)
 
+    def _render_hands(self, frame):
+        h, w = frame.shape[:2]
+        res = self._hand_lm().detect(self._image(frame))
+        # Persistent trail buffer: index fingertips paint into it and it decays,
+        # so a waving hand leaves a glowing streak ("paint in the air").
+        trail = self._trail
+        if trail is None or trail.shape[:2] != (h, w):
+            trail = np.zeros((h, w, 3), np.float32)
+        trail *= 0.90
+        marks = np.zeros_like(frame)
+        for lms in res.hand_landmarks:
+            pts = [(int(l.x * w), int(l.y * h)) for l in lms]
+            for a, b in HAND_CONNECTIONS:
+                cv2.line(marks, pts[a], pts[b], (0, 255, 255), 3, cv2.LINE_AA)
+            for p in pts:
+                cv2.circle(marks, p, 4, (255, 255, 255), -1, cv2.LINE_AA)
+            cv2.circle(trail, pts[8], 9, (60, 220, 255), -1, cv2.LINE_AA)  # index tip
+        self._trail = trail
+        base = (frame * 0.20).astype(np.int16)
+        glow = cv2.GaussianBlur(marks, (0, 0), 6).astype(np.int16)
+        out = base + trail.astype(np.int16) + marks.astype(np.int16) + glow
+        return np.clip(out, 0, 255).astype(np.uint8)
+
 
 def build_vision_backend(args):
     """Construct a VisionBackend + its available modes, or (None, []) with hints."""
     if args.no_vision:
         return None, []
     try:
-        vb = VisionBackend(args.vision_dir, args.pose_count, args.face_count)
+        vb = VisionBackend(args.vision_dir, args.pose_count, args.face_count,
+                           args.hand_count)
     except Exception as e:
         print(f"[vision] disabled ({e}); continuing without vision modes.")
         return None, []
@@ -810,6 +864,8 @@ def parse_args():
                    help="Max simultaneous people for the pose skeleton mode.")
     p.add_argument("--face-count", type=int, default=5,
                    help="Max simultaneous faces for the face-mesh mode.")
+    p.add_argument("--hand-count", type=int, default=4,
+                   help="Max simultaneous hands for the hand-tracking mode.")
     p.add_argument("--no-vision", action="store_true",
                    help="Disable MediaPipe vision modes even if models exist.")
     p.add_argument("--fps", action="store_true",
