@@ -898,7 +898,10 @@ def parse_args():
                         "default when vision modes are active).")
     p.add_argument("--fps", action="store_true",
                    help="Show the FPS overlay (off by default; toggle live with `s`).")
-    p.add_argument("--mirror", action="store_true")
+    p.add_argument("--mirror", action=argparse.BooleanOptionalAction, default=True,
+                   help="Selfie-flip the feed so it reads like a mirror (on by "
+                        "default; use --no-mirror for a true camera view). Toggle "
+                        "live with `m`.")
     p.add_argument("--smooth", type=float, default=0.0,
                    help="EMA weight on previous depth map (0=off, e.g. 0.5).")
     p.add_argument("--allow-sleep", action="store_true",
