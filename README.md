@@ -24,7 +24,8 @@ runs without that mode until you fetch it). Downloaded models are gitignored.
 |-------------------------|--------|---------------------------------------|-----------------------------|
 | Depth Anything V2 Small | ~50 MB | auto (Hugging Face, first run)        | depth effects (`e`)         |
 | Fast-neural-style `.pth`| ~26 MB | `curl` — see [style transfer](#neural-style-transfer-t-to-cycle-styles) | style modes (`t`) |
-| MediaPipe bundles       | ~18 MB | `curl` — see [vision modes](#mediapipe-vision-modes-v-to-cycle) | segmentation / pose / face mesh / hands (`v`) |
+| MediaPipe bundles       | ~18 MB | `curl` — see [vision modes](#mediapipe-vision-modes-v-to-cycle) | segmentation / pose / face mesh / hands / toon faces (`v`) |
+| AnimeGANv2 weights      | ~9 MB each | auto (torch.hub, first use of each look) | full-frame cartoonization (`a`) |
 | YuNet face detector     | ~230 KB| `curl` — see [face capture](#face-capture-optional) | optional face capture |
 
 ## Controls
@@ -36,7 +37,8 @@ runs without that mode until you fetch it). Downloaded models are gitignored.
 | `c`      | Cycle colormap          |
 | `e`      | Cycle depth effect      |
 | `t`      | Cycle neural style (style transfer) |
-| `v`      | Cycle vision mode (segmentation / pose / face mesh) |
+| `v`      | Cycle vision mode (segmentation / pose / face mesh / toon faces) |
+| `a`      | Cycle AnimeGANv2 cartoonization look |
 | `s`      | Toggle FPS overlay (off by default; `--fps` to start on) |
 | `m`      | Toggle mirror           |
 
@@ -80,6 +82,7 @@ while one is active). Each needs a MediaPipe model bundle downloaded once:
 | `pose`       | `pose_landmarker_lite.task`   | Glowing skeletons on a dimmed frame (up to 4 people) |
 | `facemesh`   | `face_landmarker.task`        | Glowing face-mesh points (up to 5 faces)      |
 | `hands`      | `hand_landmarker.task`        | Glowing hand skeletons + fingertip light-painting trails (up to 4 hands) |
+| `toonfaces`  | `face_landmarker.task`        | A random cartoon (emoji) head pasted over each face, scaled + rotated with the head; each person keeps their character while they're in frame |
 
 ```bash
 # One-time: download the model bundles (~10 MB total) into mediapipe_models/
@@ -97,8 +100,8 @@ python depth_display.py        # `v` now cycles the vision modes
 ```
 
 Each mode appears in the `v` cycle only if its bundle is present; the app prints the
-exact `curl` command for any that are missing and runs without them. `e`/`t`/`v` are
-three independent cycles, each remembering its place. Flags: `--vision-dir` (default
+exact `curl` command for any that are missing and runs without them. `e`/`t`/`v`/`a`
+are independent cycles, each remembering its place. Flags: `--vision-dir` (default
 `mediapipe_models`), `--pose-count` (4), `--face-count` (5), `--hand-count` (4),
 `--no-vision`.
 
@@ -107,6 +110,31 @@ recurring clearcut-telemetry lines). It's **silenced by default** when a vision 
 is active — which matters for the always-on `err.log` — by redirecting OS-level
 stderr; Python tracebacks are preserved. Pass `--verbose-mediapipe` to keep it for
 debugging.
+
+The `toonfaces` mode assigns each detected person a random cartoon head (rendered
+from the system color-emoji font — Groucho glasses, robots, animals, jack-o'-lanterns...)
+and keeps it stuck to them via simple position tracking, so two people keep their
+own characters. Leave frame for a couple of seconds and you'll get a fresh one.
+
+### AnimeGANv2 cartoonization (`a` to cycle looks)
+
+Turns the whole frame into a cartoon — people become anime characters. Three looks:
+
+| Look        | Style                                              |
+|-------------|-----------------------------------------------------|
+| `facepaint` | Strongest "you're an anime character" portrait look |
+| `celeba`    | Softer, painterly portrait style                    |
+| `paprika`   | Satoshi Kon movie look — bold edges, poster colors  |
+
+Weights download automatically from torch.hub on the **first use of each look**
+(~9 MB each, cached in `~/.cache/torch/hub` afterwards), so the first `a` press
+pauses the display for a few seconds; after that it's instant. No network? The
+look prints a note and passes frames through. Runs ~29 fps @ 480px on M1 MPS.
+
+| Flag           | Default | Meaning                                        |
+|----------------|---------|------------------------------------------------|
+| `--anime-size` | 480     | Longest side for inference; lower = faster     |
+| `--no-anime`   | off     | Disable the cartoonization modes               |
 
 ```bash
 # One-time: download the pretrained style weights (~26 MB) into saved_models/

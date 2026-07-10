@@ -8,7 +8,9 @@ This is a working baseline. See CLAUDE.md for the full feature list to build out
 """
 
 import argparse
+import math
 import os
+import random
 import sys
 import threading
 import time
@@ -176,6 +178,21 @@ STYLES = {
 STYLE_ORDER = list(STYLES.keys())
 
 
+# --- AnimeGANv2 full cartoonization -------------------------------------------
+# Turns the whole frame into a cartoon/anime rendering (people become anime
+# characters). Weights come from torch.hub (bryandlee/animegan2-pytorch) and are
+# fetched automatically on first use of each look (~9 MB each, cached by torch).
+# Like the styles, these repaint the RGB frame, so depth inference is skipped.
+
+ANIME_MODELS = {
+    "facepaint": "face_paint_512_v2",  # strongest "you're an anime character" look
+    "celeba": "celeba_distill",        # softer, portrait-oriented
+    "paprika": "paprika",              # painterly Satoshi Kon movie look
+}
+ANIME_ORDER = list(ANIME_MODELS.keys())
+ANIME_HUB_REPO = "bryandlee/animegan2-pytorch:main"
+
+
 # --- MediaPipe vision modes --------------------------------------------------
 # Person segmentation, pose skeletons, and face mesh via MediaPipe Tasks. Each
 # needs a model bundle downloaded once (see README / the printed hint). Like the
@@ -204,8 +221,21 @@ VISION_MODES = {
     "pose": "pose",           # glowing skeleton on a dimmed frame
     "facemesh": "face",       # glowing face-mesh points
     "hands": "hand",          # glowing hand skeletons + fingertip light-painting
+    "toonfaces": "face",      # random cartoon (emoji) head pasted over each face
 }
 VISION_ORDER = list(VISION_MODES.keys())
+
+# Cartoon heads for the toonfaces mode. Rendered as sprites from the system
+# color-emoji font at startup of the mode; if that fails (non-mac, old Pillow)
+# we fall back to procedurally drawn smiley faces so the mode always works.
+TOON_EMOJI = [
+    "😀", "😎", "🤠", "🤡", "🤖", "👽", "👹", "👻", "😈", "💀", "🎃", "🥸",
+    "🐵", "🐶", "🐱", "🦊", "🐸", "🐼", "🦁", "🐷", "🐯", "🦄", "🐨",
+]
+EMOJI_FONTS = [
+    "/System/Library/Fonts/Apple Color Emoji.ttc",       # macOS
+    "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",  # linux
+]
 
 # BlazePose 33-landmark topology (limbs + torso) for drawing the skeleton.
 POSE_CONNECTIONS = [
@@ -462,6 +492,83 @@ def build_style_backend(args):
     return sb, avail
 
 
+class AnimeBackend:
+    """AnimeGANv2 full-frame cartoonization (MPS/CUDA/CPU).
+
+    Each look is a small generator net fetched from torch.hub on first use
+    (~9 MB, cached in ~/.cache/torch/hub afterwards) — so first activation of a
+    look pauses the display for a moment while it downloads. A look that fails
+    to load (e.g. no network) is remembered and passes frames through instead
+    of retrying every frame.
+    """
+
+    def __init__(self, infer_size, device=None):
+        import torch
+        self._torch = torch
+        self.device = device or pick_device()
+        self.infer_size = infer_size
+        self._models = {}
+        self._failed = set()
+
+    def _get(self, name):
+        if name in self._failed:
+            return None
+        net = self._models.get(name)
+        if net is not None:
+            return net
+        torch = self._torch
+        weights = ANIME_MODELS[name]
+        print(f"[anime] loading {weights} from torch.hub "
+              "(first use downloads ~9 MB) ...")
+        try:
+            net = torch.hub.load(ANIME_HUB_REPO, "generator",
+                                 pretrained=weights, trust_repo=True)
+        except Exception as e:
+            print(f"[anime] {name} failed to load ({e}); "
+                  "that look will pass frames through. Needs network once.")
+            self._failed.add(name)
+            return None
+        net = net.to(self.device).eval()
+        self._models[name] = net
+        print(f"[anime] loaded {name} on {self.device}")
+        return net
+
+    def toonify(self, frame_bgr, name):
+        net = self._get(name)
+        if net is None:
+            return frame_bgr
+        torch = self._torch
+        h, w = frame_bgr.shape[:2]
+        scale = self.infer_size / max(h, w)
+        # Round infer dims to a multiple of 8 to keep the generator's
+        # down/upsample path size-consistent.
+        sw = max(64, int(w * scale) // 8 * 8)
+        sh = max(64, int(h * scale) // 8 * 8)
+        small = cv2.resize(frame_bgr, (sw, sh))
+        rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB).astype(np.float32)
+        t = (torch.from_numpy(rgb / 127.5 - 1.0)
+             .permute(2, 0, 1).unsqueeze(0).to(self.device))
+        with torch.inference_mode():
+            out = net(t).clamp(-1, 1)
+        out = ((out.squeeze(0).permute(1, 2, 0).cpu().numpy() + 1)
+               * 127.5).astype(np.uint8)
+        return cv2.resize(cv2.cvtColor(out, cv2.COLOR_RGB2BGR), (w, h))
+
+
+def build_anime_backend(args):
+    """Construct an AnimeBackend and its looks, or (None, []) with a hint."""
+    if args.no_anime:
+        return None, []
+    try:
+        ab = AnimeBackend(args.anime_size)
+    except Exception as e:
+        print(f"[anime] disabled ({e}); continuing without cartoonization.")
+        return None, []
+    print(f"[anime] on -> {', '.join(ANIME_ORDER)} @ {args.anime_size}px "
+          f"(cycle with `a`; each look downloads ~9 MB on first use)")
+    return ab, list(ANIME_ORDER)
+
+
 class VisionBackend:
     """MediaPipe Tasks: person segmentation, pose skeletons, and face mesh.
 
@@ -481,6 +588,8 @@ class VisionBackend:
         self.num_hands = num_hands
         self._pose = self._face = self._seg = self._hand = None
         self._trail = None  # decaying fingertip light-painting buffer
+        self._toon_sprites = None  # lazy BGRA sprite list for toonfaces
+        self._toon_tracks = []     # per-person sticky cartoon assignment
 
     def path(self, key):
         return os.path.join(self.models_dir, MP_MODEL_FILES[key])
@@ -547,6 +656,8 @@ class VisionBackend:
             return self._render_seg(frame_bgr, t)
         if mode == "hands":
             return self._render_hands(frame_bgr)
+        if mode == "toonfaces":
+            return self._render_toonfaces(frame_bgr, t)
         return frame_bgr
 
     @staticmethod
@@ -614,6 +725,132 @@ class VisionBackend:
         glow = cv2.GaussianBlur(marks, (0, 0), 6).astype(np.int16)
         out = base + trail.astype(np.int16) + marks.astype(np.int16) + glow
         return np.clip(out, 0, 255).astype(np.uint8)
+
+    # -- toonfaces: random cartoon head pasted over each person's face --------
+
+    @staticmethod
+    def _emoji_sprite(char, side=256):
+        """Render one emoji to a BGRA sprite, or None if no color-emoji font."""
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+        except ImportError:
+            return None
+        font = None
+        for path in EMOJI_FONTS:
+            if not os.path.exists(path):
+                continue
+            # Bitmap emoji fonts only open at their embedded strike sizes.
+            for size in (160, 137, 109, 96, 64):
+                try:
+                    font = ImageFont.truetype(path, size)
+                    break
+                except OSError:
+                    continue
+            if font is not None:
+                break
+        if font is None:
+            return None
+        size = font.size
+        canvas = Image.new("RGBA", (size * 2, size * 2), (0, 0, 0, 0))
+        ImageDraw.Draw(canvas).text((size // 2, size // 2), char,
+                                    font=font, embedded_color=True)
+        bbox = canvas.getbbox()
+        if bbox is None:  # font lacks this glyph
+            return None
+        crop = canvas.crop(bbox)
+        s = max(crop.size)
+        square = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+        square.paste(crop, ((s - crop.width) // 2, (s - crop.height) // 2))
+        rgba = np.array(square.resize((side, side), Image.LANCZOS))
+        return rgba[..., [2, 1, 0, 3]].copy()  # RGBA -> BGRA for cv2
+
+    @staticmethod
+    def _drawn_sprite(i, side=256):
+        """Fallback cartoon head drawn with cv2 (used when emoji rendering fails)."""
+        rng = random.Random(i * 7919)
+        hue = rng.randrange(180)
+        face = cv2.cvtColor(np.uint8([[[hue, 200, 255]]]), cv2.COLOR_HSV2BGR)[0, 0]
+        sp = np.zeros((side, side, 4), np.uint8)
+        c, r = side // 2, int(side * 0.46)
+        cv2.circle(sp, (c, c), r, (*(int(v) for v in face), 255), -1, cv2.LINE_AA)
+        ey, ex = int(side * 0.40), int(side * 0.18)
+        er = int(side * 0.09)
+        for dx in (-ex, ex):
+            cv2.circle(sp, (c + dx, ey), er, (255, 255, 255, 255), -1, cv2.LINE_AA)
+            cv2.circle(sp, (c + dx, ey), er // 2, (0, 0, 0, 255), -1, cv2.LINE_AA)
+        cv2.ellipse(sp, (c, int(side * 0.60)), (int(side * 0.22), int(side * 0.16)),
+                    0, 15, 165, (0, 0, 0, 255), max(3, side // 32), cv2.LINE_AA)
+        return sp
+
+    def _toon_sprite_list(self):
+        if self._toon_sprites is None:
+            sprites = [self._emoji_sprite(c) for c in TOON_EMOJI]
+            sprites = [s for s in sprites if s is not None]
+            if not sprites:
+                print("[vision] no color-emoji font; using drawn cartoon faces.")
+                sprites = [self._drawn_sprite(i) for i in range(12)]
+            self._toon_sprites = sprites
+        return self._toon_sprites
+
+    def _assign_toon(self, cx, cy, size, now, n_sprites):
+        """Sticky random sprite per person: match this face to a recent track
+        by position, or start a new track with a (preferably unused) sprite."""
+        best, best_d2 = None, None
+        for tr in self._toon_tracks:
+            d2 = (tr["cx"] - cx) ** 2 + (tr["cy"] - cy) ** 2
+            if d2 <= (1.5 * max(size, tr["size"])) ** 2 and \
+                    (best_d2 is None or d2 < best_d2):
+                best, best_d2 = tr, d2
+        if best is None:
+            in_use = {tr["idx"] for tr in self._toon_tracks}
+            free = [i for i in range(n_sprites) if i not in in_use]
+            best = {"idx": random.choice(free or range(n_sprites))}
+            self._toon_tracks.append(best)
+        best.update(cx=cx, cy=cy, size=size, last=now)
+        self._toon_tracks = [t for t in self._toon_tracks
+                             if now - t["last"] < 2.0]
+        return best["idx"]
+
+    @staticmethod
+    def _paste_sprite(dst, sprite, cx, cy, width, angle_deg):
+        """Alpha-composite a rotated, scaled BGRA sprite centered at (cx, cy)."""
+        s = int(width)
+        if s < 8:
+            return
+        sp = cv2.resize(sprite, (s, s), interpolation=cv2.INTER_AREA)
+        rot = cv2.getRotationMatrix2D((s / 2, s / 2), angle_deg, 1.0)
+        sp = cv2.warpAffine(sp, rot, (s, s), flags=cv2.INTER_LINEAR,
+                            borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0))
+        x0, y0 = int(cx - s / 2), int(cy - s / 2)
+        fx0, fy0 = max(0, x0), max(0, y0)
+        fx1, fy1 = min(dst.shape[1], x0 + s), min(dst.shape[0], y0 + s)
+        if fx1 <= fx0 or fy1 <= fy0:
+            return
+        sub = sp[fy0 - y0:fy1 - y0, fx0 - x0:fx1 - x0]
+        alpha = sub[..., 3:4].astype(np.float32) / 255.0
+        region = dst[fy0:fy1, fx0:fx1].astype(np.float32)
+        dst[fy0:fy1, fx0:fx1] = (sub[..., :3] * alpha +
+                                 region * (1 - alpha)).astype(np.uint8)
+
+    def _render_toonfaces(self, frame, t):
+        h, w = frame.shape[:2]
+        res = self._face_lm().detect(self._image(frame))
+        sprites = self._toon_sprite_list()
+        out = frame.copy()
+        for lms in res.face_landmarks:
+            # Landmarks: 33/263 = eye outer corners, 10 = forehead, 152 = chin.
+            lx, ly = lms[33].x * w, lms[33].y * h
+            rx, ry = lms[263].x * w, lms[263].y * h
+            top = np.array([lms[10].x * w, lms[10].y * h])
+            chin = np.array([lms[152].x * w, lms[152].y * h])
+            io = math.hypot(rx - lx, ry - ly)          # interocular distance
+            face_h = float(np.linalg.norm(chin - top))
+            width = max(2.5 * io, 1.4 * face_h)        # cover hair + ears
+            cx, cy = (top + chin) / 2
+            roll = -math.degrees(math.atan2(ry - ly, rx - lx))
+            idx = self._assign_toon(cx, cy, width, t, len(sprites))
+            self._paste_sprite(out, sprites[idx], cx, cy, width, roll)
+        return out
 
 
 def build_vision_backend(args):
@@ -883,6 +1120,11 @@ def parse_args():
                         "(480 ~83fps, 640 ~52fps, 720 ~40fps on M1 MPS).")
     p.add_argument("--no-style", action="store_true",
                    help="Disable neural style-transfer modes even if weights exist.")
+    p.add_argument("--anime-size", type=int, default=480,
+                   help="Longest side for AnimeGANv2 cartoonization inference. "
+                        "Lower = faster.")
+    p.add_argument("--no-anime", action="store_true",
+                   help="Disable AnimeGANv2 full-frame cartoonization modes.")
     p.add_argument("--vision-dir", default="mediapipe_models",
                    help="Directory holding MediaPipe .task/.tflite model bundles.")
     p.add_argument("--pose-count", type=int, default=4,
@@ -942,6 +1184,7 @@ def main():
 
     style_backend, avail_styles = build_style_backend(args)
     vision_backend, avail_vision = build_vision_backend(args)
+    anime_backend, avail_anime = build_anime_backend(args)
 
     # MediaPipe's native logging is very chatty; hush it for always-on use unless
     # asked to keep it. Only matters when a vision backend actually loaded.
@@ -979,6 +1222,7 @@ def main():
         ("depth", EFFECT_ORDER, ord("e")),
         ("style", avail_styles, ord("t")),
         ("vision", avail_vision, ord("v")),
+        ("anime", avail_anime, ord("a")),
     ]
     members = {g: lst for g, lst, _ in groups}
     keymap = {key: g for g, _, key in groups}
@@ -1032,6 +1276,9 @@ def main():
             elif kind == "vision":
                 # Vision modes also work on the RGB frame, no depth needed.
                 colored = vision_backend.render(frame, name, now - start)
+            elif kind == "anime":
+                # Full-frame cartoonization; also skips depth.
+                colored = anime_backend.toonify(frame, name)
             else:
                 depth = backend.infer(frame)  # frame-sized float depth map
 
